@@ -1,24 +1,8 @@
-
-name: Sapphiren Custom Kernel Builder
+ 
+name: Sapphiren Custom Kernel Build
 
 on:
   workflow_dispatch:
-    inputs:
-      build_type:
-        description: "Select build type"
-        required: true
-        type: choice
-        options:
-          - all
-          - kernel
-          - modules
-        default: all
-
-      clean_build:
-        description: "Clean previous build output"
-        required: true
-        type: boolean
-        default: true
 
 permissions:
   contents: read
@@ -26,51 +10,42 @@ permissions:
 env:
   DEVICE: sapphiren
   ARCH: arm64
-  SUBARCH: arm64
   CLANG_VERSION: clang-r450784e
-  CLANG_REPO: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
-  KERNEL_BRANCH: FirstKernel
-  JOBS: 2
+  AOSP_CLANG_COMMIT: 8b0689df9225c41530631f9bd6d7703815f08ae7
+  JOBS: "2"
 
 jobs:
   build:
-    name: Build Custom Kernel - Sapphiren
+    name: Sapphiren ARM64 Kernel
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
     steps:
 
-      # =========================================
+      # ======================================
       # 1. CHECKOUT SOURCE
-      # =========================================
+      # ======================================
 
-      - name: Checkout Kernel Repository
+      - name: Checkout FirstKernel
         uses: actions/checkout@v4
         with:
           ref: FirstKernel
           fetch-depth: 1
+          submodules: recursive
 
-      - name: Display Source Information
+      - name: Show Source Information
         run: |
-          echo "================================"
-          echo " SAPPHIRE CUSTOM KERNEL"
-          echo "================================"
-
           echo "Device: $DEVICE"
           echo "Architecture: $ARCH"
-          echo "Branch: $KERNEL_BRANCH"
+          echo "Branch: FirstKernel"
+          echo "Commit: $(git rev-parse HEAD)"
 
-          git log -1 --oneline
-
-          echo "================================"
-          echo "SOURCE STRUCTURE"
-          echo "================================"
-
+          echo "Repository structure:"
           ls -lah
 
-      # =========================================
+      # ======================================
       # 2. INSTALL DEPENDENCIES
-      # =========================================
+      # ======================================
 
       - name: Install Build Dependencies
         run: |
@@ -80,7 +55,6 @@ jobs:
             bc \
             bison \
             build-essential \
-            ccache \
             cpio \
             curl \
             flex \
@@ -88,11 +62,12 @@ jobs:
             libelf-dev \
             libncurses-dev \
             libssl-dev \
+            libdw-dev \
             lz4 \
             make \
             pahole \
             python3 \
-            python3-pip \
+            python3-dev \
             rsync \
             unzip \
             wget \
@@ -100,7 +75,8 @@ jobs:
             zstd \
             device-tree-compiler
 
-      - name: Verify Build Dependencies
+      - name: Verify Dependencies
+        shell: bash
         run: |
           set -e
 
@@ -112,107 +88,124 @@ jobs:
 
           PAHOLE_VERSION=$(
             pahole --version |
-            grep -Eo '[0-9]+\.[0-9]+' |
+            grep -oE '[0-9]+\.[0-9]+' |
             head -1
           )
 
           dpkg --compare-versions \
             "$PAHOLE_VERSION" ge 1.25
 
-          echo "pahole version: $PAHOLE_VERSION"
+          echo "pahole >= 1.25 confirmed"
 
-          echo "===== PYTHON ====="
           python3 --version
+          git --version
 
-      # =========================================
+      # ======================================
       # 3. DOWNLOAD AOSP CLANG
-      # =========================================
+      # ======================================
 
-      - name: Download AOSP Clang
+      - name: Download AOSP Clang r450784e
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          CLANG_ROOT="$RUNNER_TEMP/aosp-clang"
-          CLANG_DIR="$CLANG_ROOT/$CLANG_VERSION"
+          CLANG_DIR="$RUNNER_TEMP/$CLANG_VERSION"
+          ARCHIVE="$RUNNER_TEMP/$CLANG_VERSION.tar.gz"
 
-          mkdir -p "$CLANG_ROOT"
+          CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/$AOSP_CLANG_COMMIT/$CLANG_VERSION.tar.gz"
 
-          echo "Downloading $CLANG_VERSION"
+          echo "=================================="
+          echo "Downloading AOSP Clang"
+          echo "$CLANG_VERSION"
+          echo "=================================="
 
-          git clone \
-            --depth=1 \
-            --filter=blob:none \
-            --sparse \
-            --branch master \
-            "$CLANG_REPO" \
-            "$CLANG_ROOT/source"
+          mkdir -p "$CLANG_DIR"
 
-          cd "$CLANG_ROOT/source"
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-delay 5 \
+            --connect-timeout 30 \
+            "$CLANG_URL" \
+            --output "$ARCHIVE"
 
-          git sparse-checkout set "$CLANG_VERSION"
+          echo "Checking archive..."
 
-          if [ ! -x "$CLANG_VERSION/bin/clang" ]; then
-            echo "::error::Clang binary not found"
-            exit 1
-          fi
+          tar -tzf "$ARCHIVE" >/dev/null
 
-          mv "$CLANG_VERSION" "$CLANG_DIR"
+          echo "Extracting compiler..."
+
+          tar -xzf "$ARCHIVE" \
+            -C "$CLANG_DIR"
+
+          echo "Checking compiler..."
+
+          for tool in \
+            clang \
+            ld.lld \
+            llvm-ar \
+            llvm-nm \
+            llvm-objcopy \
+            llvm-strip
+          do
+            if [ ! -e "$CLANG_DIR/bin/$tool" ]; then
+              echo "::error::Missing LLVM binary: $tool"
+              exit 1
+            fi
+
+            echo "[OK] $tool"
+          done
 
           echo "CLANG_DIR=$CLANG_DIR" >> "$GITHUB_ENV"
-
           echo "$CLANG_DIR/bin" >> "$GITHUB_PATH"
 
-          echo "Clang installation completed"
+          echo "Clang installed successfully"
 
-      # =========================================
-      # 4. VERIFY CLANG
-      # =========================================
+          "$CLANG_DIR/bin/clang" --version
 
-      - name: Verify LLVM Toolchain
+      # ======================================
+      # 4. VERIFY TOOLCHAIN
+      # ======================================
+
+      - name: Verify Clang Toolchain
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          echo "===== CLANG ====="
+          test -x "$CLANG_DIR/bin/clang"
+
           clang --version
-
-          echo "===== LLD ====="
           ld.lld --version
-
-          echo "===== LLVM AR ====="
           llvm-ar --version
-
-          echo "===== LLVM NM ====="
           llvm-nm --version
-
-          echo "===== LLVM STRIP ====="
+          llvm-objcopy --version
           llvm-strip --version
 
-          echo "===== TOOLCHAIN PATH ====="
-          which clang
-          which ld.lld
+          echo "LLVM toolchain ready"
 
-      # =========================================
-      # 5. VALIDATE SOURCE TREE
-      # =========================================
+      # ======================================
+      # 5. VALIDATE SOURCE
+      # ======================================
 
       - name: Validate Kernel Source
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           REQUIRED_FILES=(
             "build/build.sh"
             "build/stock_defconfig"
             "build/stock-closed.symvers"
             "build/TESTED_MODULES.txt"
+            "build/VERSIONS.txt"
             "kernel_platform/msm-kernel/Makefile"
             "kernel_platform/gki-stock/vmlinux.symvers"
-            "kernel_platform/msm-kernel/arch/arm64/configs/vendor/bengal_GKI.config"
-            "kernel_platform/msm-kernel/arch/arm64/configs/vendor/sapphire_GKI.config"
           )
 
           for file in "${REQUIRED_FILES[@]}"; do
             if [ ! -f "$file" ]; then
-              echo "::error::Missing file: $file"
+              echo "::error::Missing source: $file"
               exit 1
             fi
 
@@ -233,45 +226,99 @@ jobs:
             echo "[OK] $dir"
           done
 
-      # =========================================
-      # 6. CLEAN BUILD
-      # =========================================
+          echo "Source validation completed"
 
-      - name: Clean Build Output
-        if: ${{ inputs.clean_build }}
+      # ======================================
+      # 6. PREPARE BUILD
+      # ======================================
+
+      - name: Prepare Build Environment
+        shell: bash
         run: |
-          rm -rf out
+          set -euo pipefail
 
-          rm -rf kernel_platform/msm-kernel/out
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export LLVM=1
+          export LLVM_IAS=1
 
-          rm -f kernel_platform/gki-stock/vmlinux
+          export CC=clang
+          export LD=ld.lld
+          export AR=llvm-ar
+          export NM=llvm-nm
+          export OBJCOPY=llvm-objcopy
+          export STRIP=llvm-strip
 
-          echo "Build output cleaned"
+          KERNEL="$GITHUB_WORKSPACE/kernel_platform/msm-kernel"
+          GKI="$GITHUB_WORKSPACE/kernel_platform/gki-stock"
 
-      # =========================================
-      # 7. KERNEL BUILD
-      # =========================================
+          rm -rf "$KERNEL/out"
+          rm -rf "$GITHUB_WORKSPACE/out"
 
-      - name: Build Kernel
-        if: ${{ inputs.build_type == 'all' || inputs.build_type == 'kernel' }}
+          # Remove generated BTF base only.
+          # Preserve stock symvers and System.map.
+          rm -f "$GKI/vmlinux"
+
+          mkdir -p "$GITHUB_WORKSPACE/out"
+
+          echo "Build environment ready"
+
+      # ======================================
+      # 7. BUILD KERNEL + ALL MODULES
+      # ======================================
+
+      - name: Build Kernel and Vendor Modules
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          export CLANG_DIR
-          export JOBS
+          export ARCH=arm64
+          export SUBARCH=arm64
 
-          echo "================================"
-          echo " BUILDING KERNEL"
-          echo "================================"
+          export LLVM=1
+          export LLVM_IAS=1
 
-          bash build/build.sh kernel
+          export CLANG_DIR="$CLANG_DIR"
+          export JOBS="$JOBS"
 
-          echo "================================"
-          echo " BUILDING ARM64 IMAGE"
-          echo "================================"
+          export PATH="$CLANG_DIR/bin:$PATH"
 
-          make -j"$JOBS" \
-            -C kernel_platform/msm-kernel \
+          export OUT="$GITHUB_WORKSPACE/out"
+
+          echo "=================================="
+          echo "SAPPHIREN KERNEL BUILD"
+          echo "=================================="
+
+          echo "Device: sapphiren"
+          echo "Compiler: clang-r450784e"
+          echo "Jobs: $JOBS"
+
+          echo "Starting original repository build script..."
+
+          bash build/build.sh
+
+          echo "=================================="
+          echo "KERNEL AND MODULE BUILD COMPLETED"
+          echo "=================================="
+
+      # ======================================
+      # 8. BUILD ANDROID KERNEL IMAGE
+      # ======================================
+
+      - name: Build ARM64 Image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          KERNEL="$GITHUB_WORKSPACE/kernel_platform/msm-kernel"
+
+          export PATH="$CLANG_DIR/bin:$PATH"
+
+          echo "Building ARM64 Image..."
+
+          make \
+            -j"$JOBS" \
+            -C "$KERNEL" \
             O=out \
             ARCH=arm64 \
             LLVM=1 \
@@ -280,92 +327,69 @@ jobs:
             KCFLAGS=-D__ANDROID_COMMON_KERNEL__ \
             Image
 
-          echo "Kernel build completed"
+          IMAGE="$KERNEL/out/arch/arm64/boot/Image"
 
-      # =========================================
-      # 8. VENDOR MODULE BUILD
-      # =========================================
+          if [ ! -s "$IMAGE" ]; then
+            echo "::error::Kernel Image was not generated"
+            exit 1
+          fi
 
-      - name: Build Qualcomm Vendor Modules
-        if: ${{ inputs.build_type == 'all' || inputs.build_type == 'modules' }}
+          echo "Kernel Image successfully generated"
+
+          ls -lh "$IMAGE"
+
+      # ======================================
+      # 9. VERIFY MODULE OUTPUT
+      # ======================================
+
+      - name: Verify Kernel Modules
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          export CLANG_DIR
-          export JOBS
+          MODULE_DIR="$GITHUB_WORKSPACE/out"
 
-          echo "================================"
-          echo " BUILDING QUALCOMM MODULES"
-          echo "================================"
+          COUNT=$(find "$MODULE_DIR" \
+            -maxdepth 1 -name '*.ko' | wc -l)
 
-          bash build/build.sh vendor
+          echo "Built modules: $COUNT"
 
-      # =========================================
-      # 9. XIAOMI MODULE BUILD
-      # =========================================
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No modules were generated"
+            exit 1
+          fi
 
-      - name: Build Xiaomi Modules
-        if: ${{ inputs.build_type == 'all' || inputs.build_type == 'modules' }}
-        run: |
-          set -e
+          find "$MODULE_DIR" \
+            -maxdepth 1 \
+            -name '*.ko' \
+            -printf '%f\n' | sort
 
-          export CLANG_DIR
-          export JOBS
-
-          echo "================================"
-          echo " BUILDING XIAOMI MODULES"
-          echo "================================"
-
-          bash build/build.sh xiaomi
-
-      # =========================================
-      # 10. COLLECT TESTED MODULES
-      # =========================================
-
-      - name: Collect Kernel Modules
-        if: ${{ inputs.build_type == 'all' || inputs.build_type == 'modules' }}
-        run: |
-          set -e
-
-          export CLANG_DIR
-          export JOBS
-
-          echo "================================"
-          echo " COLLECTING MODULES"
-          echo "================================"
-
-          bash build/build.sh collect
-
-          echo "Collected modules:"
-          ls -lh out/*.ko
-
-      # =========================================
-      # 11. PREPARE ARTIFACTS
-      # =========================================
+      # ======================================
+      # 10. PREPARE ARTIFACTS
+      # ======================================
 
       - name: Prepare Kernel Artifacts
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           ROOT="$GITHUB_WORKSPACE"
           KERNEL="$ROOT/kernel_platform/msm-kernel"
           DIST="$ROOT/dist"
 
-          mkdir -p "$DIST"
+          mkdir -p "$DIST/modules"
 
-          if [ -f "$KERNEL/arch/arm64/boot/Image" ]; then
-            cp "$KERNEL/arch/arm64/boot/Image" \
-              "$DIST/Image"
-          fi
+          # Kernel Image
+          cp "$KERNEL/out/arch/arm64/boot/Image" \
+            "$DIST/Image"
 
+          # Kernel symbols
           if [ -f "$KERNEL/out/vmlinux" ]; then
-            cp "$KERNEL/out/vmlinux" \
-              "$DIST/vmlinux"
+            cp "$KERNEL/out/vmlinux" "$DIST/vmlinux"
           fi
 
           if [ -f "$KERNEL/out/System.map" ]; then
-            cp "$KERNEL/out/System.map" \
-              "$DIST/System.map"
+            cp "$KERNEL/out/System.map" "$DIST/System.map"
           fi
 
           if [ -f "$KERNEL/out/Module.symvers" ]; then
@@ -373,73 +397,91 @@ jobs:
               "$DIST/Module.symvers"
           fi
 
+          # Kernel config
           if [ -f "$KERNEL/out/.config" ]; then
             cp "$KERNEL/out/.config" \
               "$DIST/kernel.config"
           fi
 
-          cp build/TESTED_MODULES.txt "$DIST/"
-          cp build/VERSIONS.txt "$DIST/"
+          # Stock symbol reference
+          cp "$ROOT/kernel_platform/gki-stock/vmlinux.symvers" \
+            "$DIST/stock-vmlinux.symvers"
 
-          if [ -d out ] && compgen -G "out/*.ko" > /dev/null; then
-            mkdir -p "$DIST/modules"
+          # Device-tested modules
+          cp "$ROOT/out/"*.ko "$DIST/modules/"
 
-            cp out/*.ko "$DIST/modules/"
+          # Module archive
+          tar -czf "$DIST/modules.tar.gz" \
+            -C "$DIST/modules" .
 
-            tar -czf "$DIST/modules.tar.gz" \
-              -C "$DIST/modules" .
-          fi
+          # Build source information
+          cp "$ROOT/build/TESTED_MODULES.txt" "$DIST/"
+          cp "$ROOT/build/VERSIONS.txt" "$DIST/"
 
-          echo "===== OUTPUT ====="
-          ls -lah "$DIST"
-
-      # =========================================
-      # 12. GENERATE BUILD INFO
-      # =========================================
-
-      - name: Generate Build Information
-        run: |
+          # Build information
           {
             echo "Device: sapphiren"
             echo "Architecture: arm64"
-            echo "Kernel base: 5.15.194"
+            echo "Kernel tree: Linux 5.15.194"
             echo "Compiler: clang-r450784e"
             echo "KernelSU: disabled"
             echo "Branch: FirstKernel"
             echo "Commit: $(git rev-parse HEAD)"
-            echo "Build type: ${{ inputs.build_type }}"
-            echo "Date: $(date -u)"
-          } > dist/BUILD_INFO.txt
+            echo "Build date: $(date -u)"
+          } > "$DIST/BUILD_INFO.txt"
 
-      # =========================================
-      # 13. UPLOAD ARTIFACTS
-      # =========================================
+          echo "=================================="
+          echo "FINAL OUTPUT"
+          echo "=================================="
 
-      - name: Upload Custom Kernel
+          find "$DIST" -maxdepth 2 -type f \
+            -printf '%p (%k KB)\n'
+
+      # ======================================
+      # 11. UPLOAD ARTIFACTS
+      # ======================================
+
+      - name: Upload Sapphiren Custom Kernel
         uses: actions/upload-artifact@v4
         with:
           name: Sapphiren-Custom-Kernel-${{ github.run_number }}
           path: dist/
           if-no-files-found: error
+          compression-level: 6
           retention-days: 14
 
-      # =========================================
-      # 14. BUILD SUMMARY
-      # =========================================
+      # ======================================
+      # 12. BUILD SUMMARY
+      # ======================================
 
       - name: Build Summary
         if: always()
         run: |
-          echo "## Sapphiren Kernel Build" >> "$GITHUB_STEP_SUMMARY"
-
-          echo "| Property | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Device | sapphiren |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Architecture | ARM64 |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Kernel | 5.15.194 |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Clang | r450784e |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| KernelSU | Disabled |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Branch | FirstKernel |" >> "$GITHUB_STEP_SUMMARY"
+          echo "# Sapphiren Custom Kernel" \
+            >> "$GITHUB_STEP_SUMMARY"
 
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "See uploaded artifact for build outputs." >> "$GITHUB_STEP_SUMMARY"
+
+          echo "| Configuration | Value |" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "|---|---|" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "| Device | sapphiren |" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "| Architecture | ARM64 |" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "| Kernel | 5.15.194 |" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "| Clang | r450784e |" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "| KernelSU | Disabled |" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "| Branch | FirstKernel |" \
+            >> "$GITHUB_STEP_SUMMARY"
