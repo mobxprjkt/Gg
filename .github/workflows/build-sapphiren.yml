@@ -1,4 +1,4 @@
-
+# This workflow is generated and may not be fully compatible with all GitHub Actions features.
 name: Sapphiren Custom Kernel Build
 
 on:
@@ -203,6 +203,7 @@ jobs:
 
           MMRM="$GITHUB_WORKSPACE/vendor/qcom/opensource/mmrm-driver"
           KBUILD="$MMRM/Kbuild"
+          DRIVER_KBUILD="$MMRM/driver/Kbuild"
 
           echo "Checking MMRM source..."
 
@@ -211,9 +212,16 @@ jobs:
             exit 1
           fi
 
-          if [ ! -f "$MMRM/test/Makefile" ]; then
+          if [ ! -f "$DRIVER_KBUILD" ]; then
+            echo "::error::MMRM driver Kbuild missing"
+            exit 1
+          fi
 
-            echo "MMRM test Makefile missing"
+          echo "MMRM Kbuild present"
+          echo "MMRM driver Kbuild present"
+
+          if grep -q 'obj-m += test/' "$KBUILD"; then
+            echo "MMRM test target found in top-level Kbuild; removing it"
 
             python3 - "$KBUILD" <<'PY'
           import sys
@@ -223,46 +231,34 @@ jobs:
           content = path.read_text()
 
           target = "obj-m += test/"
-
           lines = content.splitlines(keepends=True)
+          new_lines = [line for line in lines if line.strip() != target]
 
-          matches = [
-              line for line in lines
-              if line.strip() == target
-          ]
+          if len(new_lines) == len(lines):
+              raise SystemExit("Expected MMRM test target to be present but it was not found")
 
-          if len(matches) != 1:
-              raise SystemExit(
-                  "Expected exactly one MMRM test target, "
-                  f"found {len(matches)}"
-              )
-
-          lines = [
-              line for line in lines
-              if line.strip() != target
-          ]
-
-          path.write_text("".join(lines))
-
+          path.write_text("".join(new_lines))
           print("MMRM test target removed")
           PY
-
-          else
-            echo "MMRM test Makefile exists"
           fi
 
-          echo "===== UPDATED MMRM KBUILD ====="
+          echo "===== MMRM KBUILD ====="
           cat "$KBUILD"
 
-          grep -q 'obj-m += driver/' "$KBUILD"
-
-          if [ ! -f "$MMRM/driver/Makefile" ]; then
-            echo "::error::MMRM driver Makefile missing"
-            exit 1
-          fi
+          echo "===== MMRM DRIVER KBUILD ====="
+          cat "$DRIVER_KBUILD"
 
           if grep -q 'obj-m += test/' "$KBUILD"; then
             echo "::error::MMRM test target still enabled"
+            exit 1
+          fi
+
+          if [ -f "$MMRM/driver/Makefile" ]; then
+            echo "MMRM uses a driver/Makefile; acceptable"
+          elif [ -f "$DRIVER_KBUILD" ]; then
+            echo "MMRM uses driver/Kbuild; acceptable"
+          else
+            echo "::error::MMRM driver build file missing"
             exit 1
           fi
 
