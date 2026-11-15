@@ -1,0 +1,474 @@
+
+name: Sapphiren Custom Kernel Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DEVICE: sapphiren
+  ARCH: arm64
+  CLANG_VERSION: clang-r450784e
+  AOSP_CLANG_COMMIT: 8b0689df9225c41530631f9bd6d7703815f08ae7
+  JOBS: "2"
+
+jobs:
+  build:
+    name: Sapphiren ARM64 Kernel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+
+      # ======================================
+      # 1. CHECKOUT SOURCE
+      # ======================================
+
+      - name: Checkout FirstKernel
+        uses: actions/checkout@v4
+        with:
+          ref: FirstKernel
+          fetch-depth: 1
+
+      - name: Show Source Information
+        run: |
+          echo "Device: $DEVICE"
+          echo "Architecture: $ARCH"
+          echo "Branch: FirstKernel"
+          echo "Commit: $(git rev-parse HEAD)"
+          ls -lah
+
+      # ======================================
+      # 2. INSTALL DEPENDENCIES
+      # ======================================
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            cpio \
+            curl \
+            flex \
+            git \
+            libelf-dev \
+            libncurses-dev \
+            libssl-dev \
+            libdw-dev \
+            lz4 \
+            make \
+            pahole \
+            python3 \
+            python3-dev \
+            rsync \
+            unzip \
+            wget \
+            zip \
+            zstd \
+            device-tree-compiler
+
+      - name: Verify Dependencies
+        run: |
+          set -e
+
+          make --version
+          pahole --version
+          python3 --version
+          git --version
+
+      # ======================================
+      # 3. DOWNLOAD AOSP CLANG
+      # ======================================
+
+      - name: Download AOSP Clang r450784e
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CLANG_DIR="$RUNNER_TEMP/$CLANG_VERSION"
+          ARCHIVE="$RUNNER_TEMP/$CLANG_VERSION.tar.gz"
+
+          CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/$AOSP_CLANG_COMMIT/$CLANG_VERSION.tar.gz"
+
+          mkdir -p "$CLANG_DIR"
+
+          echo "Downloading $CLANG_VERSION"
+
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-delay 5 \
+            --connect-timeout 30 \
+            "$CLANG_URL" \
+            --output "$ARCHIVE"
+
+          tar -tzf "$ARCHIVE" >/dev/null
+
+          tar -xzf "$ARCHIVE" -C "$CLANG_DIR"
+
+          for tool in \
+            clang \
+            ld.lld \
+            llvm-ar \
+            llvm-nm \
+            llvm-objcopy \
+            llvm-strip
+          do
+            if [ ! -f "$CLANG_DIR/bin/$tool" ]; then
+              echo "::error::Missing LLVM binary: $tool"
+              exit 1
+            fi
+          done
+
+          echo "CLANG_DIR=$CLANG_DIR" >> "$GITHUB_ENV"
+          echo "$CLANG_DIR/bin" >> "$GITHUB_PATH"
+
+          "$CLANG_DIR/bin/clang" --version
+
+      # ======================================
+      # 4. VERIFY CLANG
+      # ======================================
+
+      - name: Verify LLVM Toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -x "$CLANG_DIR/bin/clang"
+
+          clang --version
+          ld.lld --version
+          llvm-ar --version
+          llvm-nm --version
+          llvm-objcopy --version
+          llvm-strip --version
+
+          echo "LLVM toolchain ready"
+
+      # ======================================
+      # 5. VALIDATE SOURCE
+      # ======================================
+
+      - name: Validate Kernel Source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REQUIRED_FILES=(
+            "build/build.sh"
+            "build/stock_defconfig"
+            "build/stock-closed.symvers"
+            "build/TESTED_MODULES.txt"
+            "kernel_platform/msm-kernel/Makefile"
+            "kernel_platform/gki-stock/vmlinux.symvers"
+          )
+
+          for file in "${REQUIRED_FILES[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "::error::Missing source: $file"
+              exit 1
+            fi
+
+            echo "[OK] $file"
+          done
+
+          REQUIRED_DIRS=(
+            "vendor/qcom/opensource"
+            "vendor/xiaomi/opensource"
+          )
+
+          for dir in "${REQUIRED_DIRS[@]}"; do
+            if [ ! -d "$dir" ]; then
+              echo "::error::Missing directory: $dir"
+              exit 1
+            fi
+
+            echo "[OK] $dir"
+          done
+
+      # ======================================
+      # 6. FIX MMRM MISSING TEST MAKEFILE
+      # ======================================
+
+      - name: Fix Qualcomm MMRM Kbuild
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MMRM="$GITHUB_WORKSPACE/vendor/qcom/opensource/mmrm-driver"
+          KBUILD="$MMRM/Kbuild"
+
+          echo "Checking MMRM source..."
+
+          if [ ! -f "$KBUILD" ]; then
+            echo "::error::MMRM Kbuild not found"
+            exit 1
+          fi
+
+          if [ ! -f "$MMRM/test/Makefile" ]; then
+
+            echo "MMRM test Makefile missing"
+
+            python3 - "$KBUILD" <<'PY'
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          content = path.read_text()
+
+          target = "obj-m += test/"
+
+          lines = content.splitlines(keepends=True)
+
+          matches = [
+              line for line in lines
+              if line.strip() == target
+          ]
+
+          if len(matches) != 1:
+              raise SystemExit(
+                  "Expected exactly one MMRM test target, "
+                  f"found {len(matches)}"
+              )
+
+          lines = [
+              line for line in lines
+              if line.strip() != target
+          ]
+
+          path.write_text("".join(lines))
+
+          print("MMRM test target removed")
+          PY
+
+          else
+            echo "MMRM test Makefile exists"
+          fi
+
+          echo "===== UPDATED MMRM KBUILD ====="
+          cat "$KBUILD"
+
+          grep -q 'obj-m += driver/' "$KBUILD"
+
+          if [ ! -f "$MMRM/driver/Makefile" ]; then
+            echo "::error::MMRM driver Makefile missing"
+            exit 1
+          fi
+
+          if grep -q 'obj-m += test/' "$KBUILD"; then
+            echo "::error::MMRM test target still enabled"
+            exit 1
+          fi
+
+          echo "MMRM patch successful"
+
+      # ======================================
+      # 7. PREPARE BUILD ENVIRONMENT
+      # ======================================
+
+      - name: Prepare Build Environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export LLVM=1
+          export LLVM_IAS=1
+
+          KERNEL="$GITHUB_WORKSPACE/kernel_platform/msm-kernel"
+
+          rm -rf "$KERNEL/out"
+          rm -rf "$GITHUB_WORKSPACE/out"
+
+          mkdir -p "$GITHUB_WORKSPACE/out"
+
+          echo "Build environment ready"
+
+      # ======================================
+      # 8. BUILD KERNEL AND VENDOR MODULES
+      # ======================================
+
+      - name: Build Kernel and Vendor Modules
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+
+          export LLVM=1
+          export LLVM_IAS=1
+
+          export CLANG_DIR="$CLANG_DIR"
+          export PATH="$CLANG_DIR/bin:$PATH"
+
+          export JOBS="$JOBS"
+
+          echo "=================================="
+          echo "SAPPHIREN CUSTOM KERNEL BUILD"
+          echo "=================================="
+
+          echo "Device: sapphiren"
+          echo "Compiler: clang-r450784e"
+          echo "Jobs: $JOBS"
+
+          bash build/build.sh
+
+          echo "Kernel and modules build completed"
+
+      # ======================================
+      # 9. VERIFY KERNEL IMAGE
+      # ======================================
+
+      - name: Verify Kernel Image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          KERNEL="$GITHUB_WORKSPACE/kernel_platform/msm-kernel"
+
+          IMAGE="$KERNEL/out/arch/arm64/boot/Image"
+
+          if [ ! -s "$IMAGE" ]; then
+            echo "::error::Kernel Image not found"
+            find "$KERNEL/out" -name Image -type f
+            exit 1
+          fi
+
+          ls -lh "$IMAGE"
+
+          echo "Kernel Image verified"
+
+      # ======================================
+      # 10. VERIFY MODULES
+      # ======================================
+
+      - name: Verify Kernel Modules
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MODULE_DIR="$GITHUB_WORKSPACE/out"
+
+          COUNT=$(find "$MODULE_DIR" \
+            -maxdepth 1 -name '*.ko' | wc -l)
+
+          echo "Built modules: $COUNT"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No modules found"
+            exit 1
+          fi
+
+          find "$MODULE_DIR" \
+            -maxdepth 1 \
+            -name '*.ko' \
+            -printf '%f\n' | sort
+
+      # ======================================
+      # 11. PREPARE ARTIFACTS
+      # ======================================
+
+      - name: Prepare Kernel Artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT="$GITHUB_WORKSPACE"
+          KERNEL="$ROOT/kernel_platform/msm-kernel"
+          DIST="$ROOT/dist"
+
+          mkdir -p "$DIST/modules"
+
+          cp "$KERNEL/out/arch/arm64/boot/Image" \
+            "$DIST/Image"
+
+          for file in \
+            vmlinux \
+            System.map \
+            Module.symvers \
+            .config
+          do
+            if [ -f "$KERNEL/out/$file" ]; then
+              case "$file" in
+                .config)
+                  cp "$KERNEL/out/$file" "$DIST/kernel.config"
+                  ;;
+                *)
+                  cp "$KERNEL/out/$file" "$DIST/$file"
+                  ;;
+              esac
+            fi
+          done
+
+          cp "$ROOT/kernel_platform/gki-stock/vmlinux.symvers" \
+            "$DIST/stock-vmlinux.symvers"
+
+          find "$ROOT/out" -maxdepth 1 \
+            -type f -name '*.ko' \
+            -exec cp {} "$DIST/modules/" \;
+
+          tar -czf "$DIST/modules.tar.gz" \
+            -C "$DIST/modules" .
+
+          cp "$ROOT/build/TESTED_MODULES.txt" "$DIST/"
+
+          if [ -f "$ROOT/build/VERSIONS.txt" ]; then
+            cp "$ROOT/build/VERSIONS.txt" "$DIST/"
+          fi
+
+          {
+            echo "Device: sapphiren"
+            echo "Architecture: arm64"
+            echo "Kernel: 5.15"
+            echo "Compiler: clang-r450784e"
+            echo "KernelSU: disabled"
+            echo "Branch: FirstKernel"
+            echo "Commit: $(git rev-parse HEAD)"
+            echo "Date: $(date -u)"
+          } > "$DIST/BUILD_INFO.txt"
+
+          echo "===== FINAL OUTPUT ====="
+          find "$DIST" -maxdepth 2 -type f -ls
+
+      # ======================================
+      # 12. UPLOAD ARTIFACTS
+      # ======================================
+
+      - name: Upload Sapphiren Custom Kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sapphiren-Custom-Kernel-${{ github.run_number }}
+          path: dist/
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 14
+
+      # ======================================
+      # 13. BUILD SUMMARY
+      # ======================================
+
+      - name: Build Summary
+        if: always()
+        run: |
+          {
+            echo "# Sapphiren Custom Kernel"
+            echo ""
+            echo "| Configuration | Value |"
+            echo "|---|---|"
+            echo "| Device | sapphiren |"
+            echo "| Architecture | ARM64 |"
+            echo "| Kernel | 5.15 |"
+            echo "| Compiler | clang-r450784e |"
+            echo "| KernelSU | Disabled |"
+            echo "| Branch | FirstKernel |"
+            echo ""
+            echo "Build status: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
